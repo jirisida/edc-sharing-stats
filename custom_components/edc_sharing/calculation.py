@@ -53,6 +53,18 @@ class TargetDailySharing:
 
 
 @dataclass(frozen=True, slots=True)
+class TargetHourlySharing:
+    """Calculated hourly values for one target EAN."""
+
+    ean: str
+    start: datetime
+    consumption: Decimal
+    grid_purchase: Decimal
+    shared: Decimal
+    coverage: Decimal
+
+
+@dataclass(frozen=True, slots=True)
 class HourlySharing:
     """Calculated values for one clock hour."""
 
@@ -489,6 +501,55 @@ def parse_hourly_profile(
                 consistency_difference=values[7],
             )
         )
+    return tuple(hourly)
+
+
+def parse_hourly_target_profiles(
+    response: dict[str, Any], *, local_tz: tzinfo | None = None
+) -> tuple[TargetHourlySharing, ...]:
+    """Aggregate quarter-hour standard profile rows into clock hours for each target."""
+    columns, content, _producers, consumers = _profile_layout(response)
+    if not content:
+        return ()
+
+    values_by_hour: dict[datetime, list[Decimal]] = {}
+    interval_occurrences: dict[tuple[date, str], int] = {}
+    for item in content:
+        start_text = str(item.get("start") or "")
+        hour_text = start_text.partition(":")[0]
+        if not hour_text.isdigit():
+            continue
+        hour = int(hour_text)
+        if not 0 <= hour <= 23:
+            continue
+        item_date = date.fromisoformat(str(item["date"])[:10])
+        interval_key = (item_date, start_text)
+        occurrence = interval_occurrences.get(interval_key, 0)
+        interval_occurrences[interval_key] = occurrence + 1
+        local_hour = datetime.combine(item_date, datetime.min.time()).replace(hour=hour)
+        hour_start = (
+            _local_hour_as_utc(local_hour, local_tz, occurrence)
+            if local_tz is not None
+            else local_hour
+        )
+        totals = values_by_hour.setdefault(hour_start, [ZERO] * len(columns))
+        _add_values(totals, item.get("values") or [], len(columns))
+
+    hourly: list[TargetHourlySharing] = []
+    for hour_start in sorted(values_by_hour):
+        values = values_by_hour[hour_start]
+        for ean, pair in sorted(consumers.items()):
+            consumption, grid_purchase, shared, coverage = _target_values(values, pair)
+            hourly.append(
+                TargetHourlySharing(
+                    ean=ean,
+                    start=hour_start,
+                    consumption=consumption,
+                    grid_purchase=grid_purchase,
+                    shared=shared,
+                    coverage=coverage,
+                )
+            )
     return tuple(hourly)
 
 

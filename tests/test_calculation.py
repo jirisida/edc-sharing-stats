@@ -579,6 +579,19 @@ class CalculationTests(unittest.TestCase):
         self.assertEqual(hours[1].consumption, Decimal("0.04"))
         self.assertEqual(hours[1].grid_purchase, Decimal("0.02"))
 
+        target_hours = calculation.parse_hourly_target_profiles(response)
+        self.assertEqual(len(target_hours), 2)
+        self.assertEqual(target_hours[0].ean, "consumer")
+        self.assertEqual(target_hours[0].start.isoformat(), "2026-08-04T00:00:00")
+        self.assertEqual(target_hours[0].shared, Decimal("0.03"))
+        self.assertEqual(target_hours[0].consumption, Decimal("0.10"))
+        self.assertEqual(target_hours[0].grid_purchase, Decimal("0.07"))
+        self.assertEqual(target_hours[1].ean, "consumer")
+        self.assertEqual(target_hours[1].start.isoformat(), "2026-08-04T01:00:00")
+        self.assertEqual(target_hours[1].shared, Decimal("0.02"))
+        self.assertEqual(target_hours[1].consumption, Decimal("0.04"))
+        self.assertEqual(target_hours[1].grid_purchase, Decimal("0.02"))
+
     def test_latest_available_day_is_used_when_today_is_delayed(self) -> None:
         response = {
             "valueColumns": [

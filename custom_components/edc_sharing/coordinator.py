@@ -29,6 +29,8 @@ from .calculation import (
     parse_daily_profile,
     parse_daily_target_profiles,
     parse_hourly_profile,
+    parse_hourly_target_profiles,
+    TargetHourlySharing,
     profile_date_ranges,
     profile_date_ranges_backwards,
     two_calendar_month_start,
@@ -47,6 +49,7 @@ from .history import (
     async_import_daily_history,
     async_import_energy_history,
     async_import_hourly_history,
+    async_import_target_hourly_history,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -195,6 +198,7 @@ class EdcSharingCoordinator(DataUpdateCoordinator[SharingStatistics]):
     """Fetch and calculate EDC statistics."""
 
     config_entry: ConfigEntry
+    _target_hours: dict[str, dict[datetime, TargetHourlySharing]] = {}
 
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry, api: EdcApiClient) -> None:
         super().__init__(
@@ -211,6 +215,7 @@ class EdcSharingCoordinator(DataUpdateCoordinator[SharingStatistics]):
         self._target_days: dict[str, dict[date, TargetDailySharing]] = {}
         self._history_target_days: dict[str, dict[date, TargetDailySharing]] = {}
         self._hours: dict[datetime, HourlySharing] = {}
+        self._target_hours: dict[str, dict[datetime, TargetHourlySharing]] = {}
         self._history_refresh_date: date | None = None
         self._history_import_enabled = False
         self._history_import_signature: tuple[object, ...] | None = None
@@ -334,6 +339,7 @@ class EdcSharingCoordinator(DataUpdateCoordinator[SharingStatistics]):
             fetched: dict[date, DailySharing] = {}
             fetched_target_days: dict[str, dict[date, TargetDailySharing]] = {}
             fetched_hours: dict[datetime, HourlySharing] = {}
+            fetched_target_hours: dict[str, dict[datetime, TargetHourlySharing]] = {}
             fetched_eans: set[EanInfo] = set()
             for chunk_from, chunk_to in profile_date_ranges(date_from, date_to):
                 local_from = datetime.combine(chunk_from, time.min, tzinfo=local_tz)
@@ -363,6 +369,13 @@ class EdcSharingCoordinator(DataUpdateCoordinator[SharingStatistics]):
                             < date_to
                         }
                     )
+                    for row in parse_hourly_target_profiles(raw, local_tz=local_tz):
+                        if (
+                            date_from
+                            <= _hour_local_date(row.start, local_tz)
+                            < date_to
+                        ):
+                            fetched_target_hours.setdefault(row.ean, {})[row.start] = row
                     fetched_eans.update(extract_eans(raw))
                 except IncompleteProfileLayoutError as err:
                     # Before both EAN roles joined the sharing group, EDC can
@@ -392,11 +405,22 @@ class EdcSharingCoordinator(DataUpdateCoordinator[SharingStatistics]):
                     for ean, rows in self._target_days.items()
                     if any(day >= date_from for day in rows)
                 }
+                self._target_hours = {
+                    ean: {
+                        start: row
+                        for start, row in rows.items()
+                        if _hour_local_date(start, local_tz) >= date_from
+                    }
+                    for ean, rows in self._target_hours.items()
+                    if any(_hour_local_date(start, local_tz) >= date_from for start in rows)
+                }
                 self._history_refresh_date = today
             self._days.update(fetched)
             self._hours.update(fetched_hours)
             for ean, rows in fetched_target_days.items():
                 self._target_days.setdefault(ean, {}).update(rows)
+            for ean, rows in fetched_target_hours.items():
+                self._target_hours.setdefault(ean, {}).update(rows)
             history_changed = any(
                 self._history_days.get(day) != row for day, row in fetched.items()
             )
@@ -569,6 +593,13 @@ class EdcSharingCoordinator(DataUpdateCoordinator[SharingStatistics]):
                         for row in parse_daily_target_profiles(raw)
                         if chunk_from <= row.day < chunk_to
                     )
+                    target_hours = tuple(
+                        row
+                        for row in parse_hourly_target_profiles(raw, local_tz=local_tz)
+                        if chunk_from
+                        <= _hour_local_date(row.start, local_tz)
+                        < chunk_to
+                    )
                 except IncompleteProfileLayoutError as err:
                     # Before both EAN roles joined the sharing group, EDC can
                     # return a valid profile containing only one side. Such a
@@ -583,6 +614,7 @@ class EdcSharingCoordinator(DataUpdateCoordinator[SharingStatistics]):
                     days = ()
                     hours = ()
                     target_days = ()
+                    target_hours = ()
                 now = dt_util.now()
                 self.history_backfill_imported_days += async_import_daily_history(
                     self.hass,
@@ -602,6 +634,17 @@ class EdcSharingCoordinator(DataUpdateCoordinator[SharingStatistics]):
                     now=now,
                     local_tz=local_tz,
                 )
+                for ean in {row.ean for row in target_hours}:
+                    target_name = ean_name(ean, self.config_entry.options)
+                    ean_hours = tuple(row for row in target_hours if row.ean == ean)
+                    async_import_target_hourly_history(
+                        self.hass,
+                        ean=ean,
+                        target_name=target_name,
+                        hours=ean_hours,
+                        now=now,
+                        local_tz=local_tz,
+                    )
                 if days:
                     self._history_days.update({row.day: row for row in days})
                     earliest = min(row.day for row in days)
@@ -761,9 +804,16 @@ class EdcSharingCoordinator(DataUpdateCoordinator[SharingStatistics]):
                 key=lambda row: row.start,
             )
         )
+        target_finalized_hours = tuple(
+            row
+            for ean in sorted(self._target_hours)
+            for row in sorted(self._target_hours[ean].values(), key=lambda r: r.start)
+            if _hour_start_utc(row.start, local_tz) < current_hour
+        )
         signature: tuple[object, ...] = (
             *finalized,
             *finalized_hours,
+            *target_finalized_hours,
             statistics.sale_price,
         )
         if signature == self._history_import_signature:
@@ -787,6 +837,17 @@ class EdcSharingCoordinator(DataUpdateCoordinator[SharingStatistics]):
                 now=now,
                 local_tz=now.tzinfo,
             )
+            imported_target_hours = 0
+            for ean, ean_hours in self._target_hours.items():
+                target_name = ean_name(ean, self.config_entry.options)
+                imported_target_hours += async_import_target_hourly_history(
+                    self.hass,
+                    ean=ean,
+                    target_name=target_name,
+                    hours=tuple(ean_hours.values()),
+                    now=now,
+                    local_tz=now.tzinfo,
+                )
         except HomeAssistantError as err:
             _LOGGER.warning("Could not import EDC history: %s", err)
             return
@@ -800,4 +861,9 @@ class EdcSharingCoordinator(DataUpdateCoordinator[SharingStatistics]):
             _LOGGER.debug(
                 "Queued %s finalized EDC hours for long-term statistics",
                 imported_hours,
+            )
+        if imported_target_hours:
+            _LOGGER.debug(
+                "Queued %s finalized EDC target hours for long-term statistics",
+                imported_target_hours,
             )

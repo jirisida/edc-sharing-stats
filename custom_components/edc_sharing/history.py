@@ -18,7 +18,7 @@ from homeassistant.const import PERCENTAGE, UnitOfEnergy
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.util.unit_conversion import EnergyConverter, UnitlessRatioConverter
 
-from .calculation import DailySharing, HourlySharing, TargetDailySharing
+from .calculation import DailySharing, HourlySharing, TargetDailySharing, TargetHourlySharing
 from .const import DOMAIN
 from .ean_settings import ean_name
 from .energy import (
@@ -136,6 +136,55 @@ HISTORY_SERIES: tuple[HistorySeries, ...] = (
     ),
 )
 
+
+@dataclass(frozen=True, slots=True)
+class TargetHistorySeries:
+    """Description of one imported target sharing statistic."""
+
+    key: str
+    name_cs: str
+    name_en: str
+    unit: str
+    unit_class: str | None
+    value_fn: Callable[[TargetHourlySharing], Decimal]
+
+
+TARGET_HISTORY_SERIES: tuple[TargetHistorySeries, ...] = (
+    TargetHistorySeries(
+        "shared",
+        "Nasdíleno",
+        "Shared",
+        UnitOfEnergy.KILO_WATT_HOUR,
+        EnergyConverter.UNIT_CLASS,
+        lambda row: row.shared,
+    ),
+    TargetHistorySeries(
+        "consumption",
+        "Spotřeba",
+        "Consumption",
+        UnitOfEnergy.KILO_WATT_HOUR,
+        EnergyConverter.UNIT_CLASS,
+        lambda row: row.consumption,
+    ),
+    TargetHistorySeries(
+        "grid",
+        "Dokup ze sítě",
+        "Grid purchase",
+        UnitOfEnergy.KILO_WATT_HOUR,
+        EnergyConverter.UNIT_CLASS,
+        lambda row: row.grid_purchase,
+    ),
+    TargetHistorySeries(
+        "coverage",
+        "Pokrytí sdílením",
+        "Sharing coverage",
+        PERCENTAGE,
+        UnitlessRatioConverter.UNIT_CLASS,
+        lambda row: row.coverage,
+    ),
+)
+
+
 # EDC rows are values for one completed hour/day, not monotonically increasing
 # lifetime counters. Dedicated hourly and daily statistic IDs therefore use
 # mean/min/max and deliberately do not publish a cumulative ``sum``.
@@ -242,6 +291,69 @@ def async_import_hourly_history(
             ),
             source=DOMAIN,
             statistic_id=f"{DOMAIN}:{sse_id}_{series.key}_hourly",
+            unit_class=series.unit_class,
+            unit_of_measurement=series.unit,
+        )
+        async_add_external_statistics(hass, metadata, statistics)
+    return len(finalized)
+
+
+@callback
+def async_import_target_hourly_history(
+    hass: HomeAssistant,
+    *,
+    ean: str,
+    target_name: str,
+    hours: tuple[TargetHourlySharing, ...],
+    now: datetime,
+    local_tz: tzinfo,
+) -> int:
+    """Queue completed EDC target hours as idempotent external statistics."""
+    aware_now = now if now.tzinfo is not None else now.replace(tzinfo=local_tz)
+    current_hour = aware_now.replace(
+        minute=0, second=0, microsecond=0
+    ).astimezone(UTC)
+    finalized = tuple(
+        row
+        for row in hours
+        if (
+            row.start
+            if row.start.tzinfo is not None
+            else row.start.replace(tzinfo=local_tz).astimezone(UTC)
+        )
+        < current_hour
+    )
+    if not finalized:
+        return 0
+
+    czech = hass.config.language.casefold().startswith("cs")
+    for series in TARGET_HISTORY_SERIES:
+        statistics: list[StatisticData] = []
+        for row in finalized:
+            value = float(series.value_fn(row))
+            start = (
+                row.start
+                if row.start.tzinfo is not None
+                else row.start.replace(tzinfo=local_tz)
+            )
+            statistics.append(
+                StatisticData(
+                    start=start,
+                    mean=value,
+                    min=value,
+                    max=value,
+                )
+            )
+        clean_ean = ean.replace("-", "_").lower()
+        metadata = StatisticMetaData(
+            mean_type=StatisticMeanType.ARITHMETIC,
+            has_sum=False,
+            name=(
+                f"{target_name} – {series.name_cs if czech else series.name_en} – "
+                f"{'hodinová historie' if czech else 'hourly history'}"
+            ),
+            source=DOMAIN,
+            statistic_id=f"{DOMAIN}:{clean_ean}_{series.key}_hourly",
             unit_class=series.unit_class,
             unit_of_measurement=series.unit,
         )

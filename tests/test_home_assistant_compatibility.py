@@ -160,6 +160,7 @@ class HomeAssistantCompatibilityTest(unittest.TestCase):
         coordinator._target_days = {}
         coordinator._history_target_days = {}
         coordinator._hours = {}
+        coordinator._target_hours = {}
         coordinator._history_refresh_date = None
         coordinator._history_import_enabled = False
         coordinator.history_earliest_date = None
@@ -207,6 +208,32 @@ class HomeAssistantCompatibilityTest(unittest.TestCase):
         self.assertTrue(revenue_metadata["has_sum"])
         self.assertEqual(revenue_metadata["unit_of_measurement"], "CZK")
         self.assertEqual(points[-1]["sum"], 8)
+
+    def test_target_hourly_export_passes_real_recorder_validation(self) -> None:
+        from custom_components.edc_sharing.calculation import TargetHourlySharing
+        from custom_components.edc_sharing.history import async_import_target_hourly_history
+
+        start = datetime(2026, 10, 1, 10, tzinfo=UTC)
+        row = TargetHourlySharing(
+            "target_example", start, Decimal(10), Decimal(6), Decimal(4), Decimal(40)
+        )
+        recorder = Mock()
+        with patch(
+            "homeassistant.components.recorder.statistics.get_instance", return_value=recorder
+        ):
+            async_import_target_hourly_history(
+                SimpleNamespace(config=SimpleNamespace(language="en")),
+                ean="target_example",
+                target_name="Example target",
+                hours=(row,),
+                now=datetime(2026, 10, 1, 12, tzinfo=UTC),
+                local_tz=UTC,
+            )
+        self.assertEqual(recorder.async_import_statistics.call_count, 4)
+        metadata, points, _table = recorder.async_import_statistics.call_args_list[0].args
+        self.assertFalse(metadata["has_sum"])
+        self.assertEqual(metadata["statistic_id"], "edc_sharing:target_example_shared_hourly")
+        self.assertEqual(points[0]["mean"], 4.0)
 
     def test_cached_daily_row_round_trip_preserves_precision(self) -> None:
         from custom_components.edc_sharing.calculation import (
